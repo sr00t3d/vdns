@@ -1,0 +1,49 @@
+#!/bin/bash
+# Author: Percio Andrade [ percio@zendev.com.br ]
+# Shell script to consult dns and register from domain
+# Version : 1.6
+
+# Variables
+VERSION="1.6"
+DATE=$(date)
+DOMAIN=$2
+
+# Updated to RDAP 
+REG_BR_WHOIS="https://rdap.registro.br/domain/"
+#REG_BR_WHOIS="https://registro.br/2/whois?qr="
+
+# Used to check script version
+vDNS="https://raw.githubusercontent.com/percioandrade/vdns/master/vdns" 
+
+# Identify OS type (RHEL/Debian)
+if [ -f /etc/redhat-release ]; then
+  # RHEL based system (use yum)
+  LIB="perl-libwww-perl"
+  SOCKET="libio-socket-ssl-perl"
+  PACKAGE_MANAGER="yum list --instaled"
+  $PACKAGE_CHECK="list installed"
+elif [ -f /etc/debian_version ]; then
+  PACKAGE_A=$(apt list --instaled | grep -o $LIB)
+  PACKAGE_B=$(apt list --instaled | grep -o $SOCKET)
+  if [ ! $PACKAGE_A ];
+    echo "[!] $LIB is not installed. Installing..."
+    apt install $LIB
+  fi
+  if [ ! $PACKAGE_B ];
+    echo "[!] $SOCKET is not installed. Installing..."
+    apt install $SOCKET
+  fi
+else
+  # Could not detect OS, exit with message
+  echo "Error: Could not identify OS. Exiting."
+  exit 1
+fi
+
+# Check if package is installed
+if ! $PACKAGE_MANAGER $PACKAGE_CHECK | grep -o "$PACKAGE_NAME"; then
+  echo "$PACKAGE_NAME is not installed. Installing..."
+  sudo $PACKAGE_MANAGER install -y $PACKAGE_NAME
+else
+  echo "$PACKAGE_NAME is already installed."
+fi
+
