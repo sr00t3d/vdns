@@ -7,7 +7,7 @@
 - **Integração oficial com o RDAP do Registro.br** (`https://rdap.registro.br/domain/<dominio>`): extrai status do domínio, datas de registro, alteração e expiração, estado do DNSSEC (`signed`/`unsigned`), entidade/titular e nameservers delegados.
 - **Consulta RDAP global** (`https://rdap.org/domain/<dominio>`): segue automaticamente os redirecionamentos do bootstrap RDAP da IANA para domínios internacionais.
 - **Parsing JSON resiliente**: utiliza `jq` quando disponível, faz fallback automático para `python3` (biblioteca padrão `json`) e degrada com segurança para `grep`/`sed` POSIX.
-- **Fallback opcional para WHOIS** (`--whois-fallback`): recorre à porta 43 (`whois.registro.br` / `whois`) caso o endpoint RDAP esteja bloqueado ou inacessível.
+- **Fallback automático para WHOIS** (ativado por padrão; desative com `--no-whois-fallback`): detecta ccTLDs sem servidor RDAP no bootstrap da IANA (ex.: `.io`, `.de`, `.me`, `.co`) ou rate-limit (`429`) e recorre automaticamente ao `whois` na porta 43, evitando falsos positivos de domínio "não registrado".
 - **Diagnóstico completo de DNS e e-mail**: NS, NS da zona pai (com suporte a Public Suffix List), NSR autoritativo, `A`/`AAAA`/`www`, ping ICMP, MX, reverso PTR, SPF, DMARC, DKIM com seletor customizável (`--dkim-selector`), registros SRV do Microsoft 365 / Lync, dump em formato de zona BIND (`-B`) e teste de propagação em resolvers públicos (`1.1.1.1`, `8.8.8.8`, `9.9.9.9`, `208.67.222.222`).
 - **Saídas estruturadas para automação**: `-F table|json|csv` (ou `--json` / `--csv`), `-q/--quiet`, `--no-color` e salvamento limpo sem códigos ANSI (`-s/--save`) com permissão `chmod 600`.
 - **Validação defensiva de entrada**: normaliza URLs e pontos finais e rejeita domínios malformados antes de qualquer requisição.
@@ -82,7 +82,8 @@ vdns -a -s example.com
 | `-B`, `--bind` | Saída em formato de zona BIND (`$ORIGIN` + registros) |
 | `-F`, `--format <fmt>` | Formato de saída: `table` (padrão), `json`, `csv` |
 | `--json` / `--csv` | Atalhos para `-F json` / `-F csv` |
-| `--whois-fallback` | Fallback para `whois` na porta 43 se o RDAP falhar |
+| `--whois-fallback` | Ativa fallback automático para `whois` na porta 43 (padrão) |
+| `--no-whois-fallback` | Desativa fallback automático para `whois` (somente RDAP estrito) |
 | `--insecure` | Permite `curl -k` no TLS do RDAP (desativado por padrão) |
 | `-s`, `--save` | Salva relatório sem ANSI em `<dominio>.txt` (`chmod 600`) |
 | `-q`, `--quiet` | Oculta o cabeçalho decorativo |

@@ -6,13 +6,13 @@
 #  Website : https://perciocastelo.com.br
 #  Repo    : https://github.com/sr00t3d/vdns
 #  License : Apache-2.0
-#  Version : 2.0.0
+#  Version : 2.1.0
 # ==============================================================================
 
 set -uo pipefail
 
 readonly SCRIPT_NAME="vdns"
-readonly VERSION="2.0.0"
+readonly VERSION="2.1.0"
 readonly REG_BR_RDAP="https://rdap.registro.br/domain/"
 readonly GLOBAL_RDAP="https://rdap.org/domain/"
 readonly UPDATE_URL="https://raw.githubusercontent.com/sr00t3d/vdns/main/vdns"
@@ -23,7 +23,7 @@ FORMAT="table"
 QUIET=0
 NO_COLOR=0
 INSECURE_TLS=0
-WHOIS_FALLBACK=0
+WHOIS_FALLBACK=1
 DKIM_SELECTOR="default"
 SAVE_FILE=""
 DO_SAVE=0
@@ -72,6 +72,7 @@ VPING="unknown"
 RDAP_BODY=""
 RDAP_CODE="000"
 RDAP_URL=""
+RDAP_EFF_URL=""
 RDAP_SOURCE=""
 RDAP_STATUS_STATE="skipped"
 RDAP_MSG=""
@@ -123,7 +124,7 @@ init_colors() {
 
 show_help() {
   cat <<'USAGE'
-vdns v2.0.0 — DNS & Registrar Diagnostic CLI (RDAP + Authoritative DNS)
+vdns v2.1.0 — DNS & Registrar Diagnostic CLI (RDAP + WHOIS Fallback + DNS)
 
 Usage:
   vdns [options] <domain>
@@ -143,15 +144,16 @@ Lookup Options:
   -k, --dkim                 DKIM TXT record (selector via --dkim-selector, default: default)
   -o, --office               Microsoft 365 / Lync SRV records
   -b, --br                   Registro.br RDAP lookup (.br domains)
-  -i, --intl                 Global RDAP lookup via rdap.org (non-.br domains)
-  -c, --registrar            Auto registrar lookup (.br -> Registro.br, other -> rdap.org)
+  -i, --intl                 Global RDAP lookup via rdap.org + auto WHOIS fallback
+  -c, --registrar            Auto registrar lookup (.br -> Registro.br, other -> rdap.org/WHOIS)
   -l, --propagation          Propagation check on Cloudflare, Google, Quad9, OpenDNS
   -B, --bind                 BIND-style zone output ($ORIGIN + records)
 
 Output & Behavior Options:
   -F, --format <fmt>         Output format: table (default), json, csv
   --dkim-selector <name>     Custom DKIM selector (default: default)
-  --whois-fallback           Fallback to port-43 whois if RDAP is unreachable
+  --whois-fallback           Enable automatic port-43 WHOIS fallback (enabled by default)
+  --no-whois-fallback        Disable automatic port-43 WHOIS fallback (strict RDAP only)
   --insecure                 Allow curl -k for RDAP TLS (off by default)
   -s, --save                 Save clean (ANSI-free) output to <domain>.txt (chmod 600)
   -q, --quiet                Suppress banner header
@@ -291,41 +293,48 @@ check_update() {
 
 rdap_fetch() {
   local url="$1"
-  local out
+  local out meta
   local -a opts=(
     -sS -L
     --connect-timeout 5
-    --max-time 10
+    --max-time 12
     -H 'Accept: application/rdap+json, application/json;q=0.9'
-    -w $'\n%{http_code}'
+    -w $'\n%{http_code}|%{url_effective}'
   )
   [[ "$INSECURE_TLS" -eq 1 ]] && opts+=(-k)
 
   RDAP_BODY=""
   RDAP_CODE="000"
   RDAP_URL="$url"
+  RDAP_EFF_URL="$url"
 
   out="$(curl "${opts[@]}" "$url" 2>/dev/null || true)"
   if [[ -z "$out" ]]; then
     return 1
   fi
 
-  RDAP_CODE="${out##*$'\n'}"
+  meta="${out##*$'\n'}"
   RDAP_BODY="${out%$'\n'*}"
+  RDAP_CODE="${meta%%|*}"
+  RDAP_EFF_URL="${meta#*|}"
 
   # Retry once with browser-like headers if WAF returns 403
   if [[ "$RDAP_CODE" == "403" ]]; then
-    out="$(curl -sS -L --connect-timeout 5 --max-time 10 \
-      -A "$RDAP_UA" \
-      -H 'Accept: application/rdap+json, application/json;q=0.9,*/*;q=0.8' \
-      -H 'Accept-Language: pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7' \
-      -H 'Referer: https://registro.br/' \
-      $([[ "$INSECURE_TLS" -eq 1 ]] && printf '%s' '-k') \
-      -w $'\n%{http_code}' \
-      "$url" 2>/dev/null || true)"
+    local -a retry_opts=(
+      -sS -L --connect-timeout 5 --max-time 12
+      -A "$RDAP_UA"
+      -H 'Accept: application/rdap+json, application/json;q=0.9,*/*;q=0.8'
+      -H 'Accept-Language: pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7'
+      -H 'Referer: https://registro.br/'
+      -w $'\n%{http_code}|%{url_effective}'
+    )
+    [[ "$INSECURE_TLS" -eq 1 ]] && retry_opts+=(-k)
+    out="$(curl "${retry_opts[@]}" "$url" 2>/dev/null || true)"
     if [[ -n "$out" ]]; then
-      RDAP_CODE="${out##*$'\n'}"
+      meta="${out##*$'\n'}"
       RDAP_BODY="${out%$'\n'*}"
+      RDAP_CODE="${meta%%|*}"
+      RDAP_EFF_URL="${meta#*|}"
     fi
   fi
 
@@ -350,6 +359,7 @@ rdap_parse_json() {
         (.vcardArray[1]? // [] | map(select(.[0] == "fn") | .[3]) | .[0] // "");
       def entity_by_role($r):
         ([.entities[]? | select((.roles // []) | index($r)) | vcard_fn | select(length > 0)][0] // "");
+      . as $root |
       [
         (.ldhName // ""),
         ((.status // []) | join(", ")),
@@ -359,7 +369,7 @@ rdap_parse_json() {
         (if .secureDNS.delegationSigned == true then "signed"
          elif .secureDNS.delegationSigned == false then "unsigned"
          else "" end),
-        (entity_by_role("registrar") | if length > 0 then . else entity_by_role("registrant") end),
+        (($root | entity_by_role("registrar") | select(length > 0)) // ($root | entity_by_role("registrant") | select(length > 0)) // ""),
         ([.nameservers[]?.ldhName // empty] | join(", "))
       ] | join("\t")
     ' 2>/dev/null <<<"$RDAP_BODY" || true)"
@@ -419,23 +429,44 @@ whois_fallback_check() {
   if ! command -v whois >/dev/null 2>&1; then
     return 1
   fi
-  local raw server=""
-  if is_br_domain; then
-    server="-h whois.registro.br"
+  local raw=""
+  local -a wcmd=(whois)
+  if command -v timeout >/dev/null 2>&1; then
+    wcmd=(timeout 8 whois)
   fi
-  # shellcheck disable=SC2086
-  raw="$(whois $server "$DOMAIN" 2>/dev/null || true)"
+  if is_br_domain; then
+    raw="$("${wcmd[@]}" -h whois.registro.br "$DOMAIN" 2>/dev/null || true)"
+  else
+    raw="$("${wcmd[@]}" "$DOMAIN" 2>/dev/null || true)"
+  fi
   [[ -z "$raw" ]] && return 1
-  if printf '%s' "$raw" | grep -Eqi 'No match for|NOT FOUND|No entries found'; then
+
+  # Reject error-only WHOIS responses (no server for TLD / rate limit / timeout)
+  if printf '%s' "$raw" | grep -Eqi 'No whois server is known|TLD is not supported|You have exceeded|Quota exceeded|access denied|connection refused|timed out'; then
+    return 1
+  fi
+
+  if printf '%s' "$raw" | grep -Eqi 'No match for|NOT FOUND|No entries found|^Status:[[:space:]]*free|No Data Found|DOMAIN NOT FOUND|The queried object does not exist|No such domain|is available for registration|No Object Found'; then
     RDAP_STATUS_STATE="unregistered"
+    RDAP_SOURCE="whois-fallback"
     RDAP_MSG="${DOMAIN} appears unregistered (WHOIS fallback)."
     return 0
   fi
+
   RDAP_STATUS_STATE="registered"
-  RDAP_SOURCE="${RDAP_SOURCE}+whois"
+  RDAP_SOURCE="whois-fallback"
   RDAP_LDH="$DOMAIN"
-  RDAP_DOM_STATUS="$(printf '%s\n' "$raw" | awk -F: '/^status:/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')"
-  RDAP_EXPIRES="$(printf '%s\n' "$raw" | awk -F: '/^expires:/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')"
+  RDAP_DOM_STATUS="$(printf '%s\n' "$raw" | awk -F: 'BEGIN{IGNORECASE=1} /^[[:space:]]*(Domain Status|Status|Registration status):/ {v=$2; gsub(/^[ \t]+|[ \t\r]+$/, "", v); sub(/[ \t]+https?:\/\/.*$/, "", v); if (v != "") {print v; exit}}' || true)"
+  RDAP_CREATED="$(printf '%s\n' "$raw" | awk -F': ' 'BEGIN{IGNORECASE=1} /^[[:space:]]*(Creation Date|Created|Registered on|created):/ {v=$2; gsub(/^[ \t]+|[ \t\r]+$/, "", v); if (v != "") {print v; exit}}' || true)"
+  RDAP_CHANGED="$(printf '%s\n' "$raw" | awk -F': ' 'BEGIN{IGNORECASE=1} /^[[:space:]]*(Updated Date|Changed|Last updated):/ {v=$2; gsub(/^[ \t]+|[ \t\r]+$/, "", v); if (v != "") {print v; exit}}' || true)"
+  RDAP_EXPIRES="$(printf '%s\n' "$raw" | awk -F': ' 'BEGIN{IGNORECASE=1} /^[[:space:]]*(Registry Expiry Date|Expiry date|Expiration Date|paid-till|expires):/ {v=$2; gsub(/^[ \t]+|[ \t\r]+$/, "", v); if (v != "") {print v; exit}}' || true)"
+  RDAP_REGISTRAR="$(printf '%s\n' "$raw" | awk -F': ' 'BEGIN{IGNORECASE=1} /^[[:space:]]*(Registrar|owner):/ {v=$2; gsub(/^[ \t]+|[ \t\r]+$/, "", v); if (v != "") {print v; exit}}' || true)"
+  RDAP_NS_LIST="$(printf '%s\n' "$raw" | awk -F: 'BEGIN{IGNORECASE=1} /^[[:space:]]*(Name Server|Nserver):/ {v=$2; gsub(/^[ \t]+|[ \t\r]+$/, "", v); sub(/[ \t]+.*$/, "", v); if (v != "") print tolower(v)}' | sort -u | paste -sd ', ' - || true)"
+  if printf '%s' "$raw" | grep -Eqi 'DNSSEC:[[:space:]]*signedDelegation|dsrecord:'; then
+    RDAP_DNSSEC="signed"
+  elif printf '%s' "$raw" | grep -Eqi 'DNSSEC:[[:space:]]*unsigned'; then
+    RDAP_DNSSEC="unsigned"
+  fi
   RDAP_MSG="${DOMAIN} is registered (WHOIS fallback)."
   return 0
 }
@@ -464,12 +495,23 @@ query_registrar() {
       return
     fi
     RDAP_STATUS_STATE="error"
-    RDAP_MSG="RDAP unreachable (${endpoint}). Check egress/DNS or try --whois-fallback."
+    RDAP_MSG="RDAP unreachable (${endpoint}). Check egress/DNS."
     return
   fi
 
   local body_code
   body_code="$(rdap_body_error_code)"
+
+  # Detect TLDs without IANA RDAP bootstrap (rdap.org returns 404 without redirecting)
+  if [[ "$mode" == "intl" && ( "$RDAP_CODE" == "404" || "$body_code" == "404" ) ]] && \
+     { [[ "$RDAP_EFF_URL" == "${GLOBAL_RDAP}"* ]] || printf '%s' "$RDAP_BODY" | grep -qi 'No RDAP service'; }; then
+    if [[ "$WHOIS_FALLBACK" -eq 1 ]] && whois_fallback_check; then
+      return
+    fi
+    RDAP_STATUS_STATE="rdap_unsupported"
+    RDAP_MSG="TLD for ${DOMAIN} has no RDAP server in IANA bootstrap (install whois or enable --whois-fallback)."
+    return
+  fi
 
   if [[ "$RDAP_CODE" == "404" || "$body_code" == "404" ]]; then
     RDAP_STATUS_STATE="unregistered"
@@ -478,6 +520,9 @@ query_registrar() {
   fi
 
   if [[ "$RDAP_CODE" == "429" ]]; then
+    if [[ "$WHOIS_FALLBACK" -eq 1 ]] && whois_fallback_check; then
+      return
+    fi
     RDAP_STATUS_STATE="rate_limited"
     RDAP_MSG="RDAP rate limited (HTTP 429) at ${endpoint}."
     return
@@ -592,7 +637,7 @@ render_registrar_table() {
   printf '\n%s---- REGISTRAR (RDAP) ----%s\n' "$UNDER" "$RESET"
   case "$RDAP_STATUS_STATE" in
     registered)   printf '%s %s\n' "$OK" "$RDAP_MSG" ;;
-    unregistered|not_applicable|unknown|rate_limited) printf '%s %s\n' "$ATT" "$RDAP_MSG" ;;
+    unregistered|not_applicable|unknown|rate_limited|rdap_unsupported) printf '%s %s\n' "$ATT" "$RDAP_MSG" ;;
     *)            printf '%s %s\n' "$FAIL" "$RDAP_MSG" ;;
   esac
   [[ -n "$RDAP_URL" ]]        && printf '  Endpoint   : %s (HTTP %s)\n' "$RDAP_URL" "$RDAP_CODE"
@@ -849,9 +894,10 @@ main() {
       --bind)           args+=("-B"); shift ;;
       --save)           args+=("-s"); shift ;;
       --quiet)          args+=("-q"); shift ;;
-      --no-color)       NO_COLOR=1; shift ;;
-      --insecure)       INSECURE_TLS=1; shift ;;
-      --whois-fallback) WHOIS_FALLBACK=1; shift ;;
+      --no-color)          NO_COLOR=1; shift ;;
+      --insecure)          INSECURE_TLS=1; shift ;;
+      --whois-fallback)    WHOIS_FALLBACK=1; shift ;;
+      --no-whois-fallback) WHOIS_FALLBACK=0; shift ;;
       --json)           FORMAT="json"; shift ;;
       --csv)            FORMAT="csv"; shift ;;
       --format)

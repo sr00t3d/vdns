@@ -7,7 +7,7 @@
 - **Official Registro.br RDAP integration** (`https://rdap.registro.br/domain/<domain>`): parses domain status, registration/update/expiration dates, DNSSEC state (`signed`/`unsigned`), entity/registrar, and delegated nameservers.
 - **Global RDAP lookup** (`https://rdap.org/domain/<domain>`): follows IANA RDAP bootstrap redirects automatically for international TLDs.
 - **Zero mandatory JSON parser dependency**: parses RDAP JSON via `jq`, falls back automatically to `python3` stdlib `json`, and degrades gracefully to POSIX `grep`/`sed`.
-- **Optional WHOIS fallback** (`--whois-fallback`): falls back to port 43 (`whois.registro.br` / `whois`) if RDAP is blocked or unreachable.
+- **Automatic WHOIS fallback** (enabled by default; disable with `--no-whois-fallback`): detects ccTLDs without an IANA RDAP bootstrap server (e.g. `.io`, `.de`, `.me`, `.co`) or RDAP rate-limits (`429`) and falls back seamlessly to port-43 `whois` without false "unregistered" results.
 - **Complete DNS & email diagnostics**: NS, parent-zone NS (Public Suffix List aware), authoritative NSR, `A`/`AAAA`/`www`, ICMP ping, MX, reverse PTR, SPF, DMARC, custom-selector DKIM (`--dkim-selector`), Microsoft 365 / Lync SRV, BIND-style zone dump (`-B`), and multi-resolver propagation (`1.1.1.1`, `8.8.8.8`, `9.9.9.9`, `208.67.222.222`).
 - **Structured automation outputs**: `-F table|json|csv` (or `--json` / `--csv`), `-q/--quiet`, `--no-color`, and ANSI-stripped `-s/--save` reports created with `chmod 600`.
 - **Input hardening**: normalizes URLs/trailing dots and validates domain syntax before any network call.
@@ -82,7 +82,8 @@ vdns -a -s example.com
 | `-B`, `--bind` | BIND-style zone output (`$ORIGIN` + records) |
 | `-F`, `--format <fmt>` | Output format: `table` (default), `json`, `csv` |
 | `--json` / `--csv` | Shorthand for `-F json` / `-F csv` |
-| `--whois-fallback` | Fallback to port-43 `whois` if RDAP is unreachable |
+| `--whois-fallback` | Enable automatic port-43 `whois` fallback (enabled by default) |
+| `--no-whois-fallback` | Disable automatic port-43 `whois` fallback (strict RDAP only) |
 | `--insecure` | Allow `curl -k` for RDAP TLS (disabled by default) |
 | `-s`, `--save` | Save ANSI-free report to `<domain>.txt` (`chmod 600`) |
 | `-q`, `--quiet` | Suppress banner header |
