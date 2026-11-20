@@ -1,49 +1,981 @@
-#!/bin/bash
-# Author: Percio Andrade [ percio@zendev.com.br ]
-# Shell script to consult dns and register from domain
-# Version : 1.6
+#!/usr/bin/env bash
+# ==============================================================================
+#  vdns — DNS & Registrar Diagnostic CLI (RDAP + Authoritative DNS)
+# ==============================================================================
+#  Author  : Percio Castelo <percio@perciocastelo.com.br>
+#  Website : https://perciocastelo.com.br
+#  Repo    : https://github.com/sr00t3d/vdns
+#  License : Apache-2.0
+#  Version : 2.0.0
+# ==============================================================================
 
-# Variables
-VERSION="1.6"
-DATE=$(date)
-DOMAIN=$2
+set -uo pipefail
 
-# Updated to RDAP 
-REG_BR_WHOIS="https://rdap.registro.br/domain/"
-#REG_BR_WHOIS="https://registro.br/2/whois?qr="
+readonly SCRIPT_NAME="vdns"
+readonly VERSION="2.0.0"
+readonly REG_BR_RDAP="https://rdap.registro.br/domain/"
+readonly GLOBAL_RDAP="https://rdap.org/domain/"
+readonly UPDATE_URL="https://raw.githubusercontent.com/sr00t3d/vdns/main/vdns"
+readonly RDAP_UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
-# Used to check script version
-vDNS="https://raw.githubusercontent.com/percioandrade/vdns/master/vdns" 
+# Runtime flags
+FORMAT="table"
+QUIET=0
+NO_COLOR=0
+INSECURE_TLS=0
+WHOIS_FALLBACK=0
+DKIM_SELECTOR="default"
+SAVE_FILE=""
+DO_SAVE=0
 
-# Identify OS type (RHEL/Debian)
-if [ -f /etc/redhat-release ]; then
-  # RHEL based system (use yum)
-  LIB="perl-libwww-perl"
-  SOCKET="libio-socket-ssl-perl"
-  PACKAGE_MANAGER="yum list --instaled"
-  $PACKAGE_CHECK="list installed"
-elif [ -f /etc/debian_version ]; then
-  PACKAGE_A=$(apt list --instaled | grep -o $LIB)
-  PACKAGE_B=$(apt list --instaled | grep -o $SOCKET)
-  if [ ! $PACKAGE_A ];
-    echo "[!] $LIB is not installed. Installing..."
-    apt install $LIB
+DO_ALL=0
+DO_NS=0
+DO_DNS=0
+DO_WWW=0
+DO_PING=0
+DO_MX=0
+DO_REVERSE=0
+DO_SPF=0
+DO_DKIM=0
+DO_BR=0
+DO_INT=0
+DO_OFFICE=0
+DO_BIND=0
+DO_PROP=0
+
+HAVE_JQ=0
+HAVE_PY3=0
+PSL_FILE=""
+DOMAIN=""
+TIMESTAMP_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+# Collected data
+PARENT_ZONE=""
+ROOTS=""
+SRV=""
+NAMESERVER=""
+NS_LIST=""
+A_REC=""
+AAAA_REC=""
+WWW_A=""
+WWW_CNAME=""
+MX_REC=""
+REVERSE_PTR=""
+SPF_REC=""
+DMARC_REC=""
+DKIM_REC=""
+OFFICE_SRV1=""
+OFFICE_SRV2=""
+VPING="unknown"
+
+# RDAP state
+RDAP_BODY=""
+RDAP_CODE="000"
+RDAP_URL=""
+RDAP_SOURCE=""
+RDAP_STATUS_STATE="skipped"
+RDAP_MSG=""
+RDAP_LDH=""
+RDAP_DOM_STATUS=""
+RDAP_CREATED=""
+RDAP_CHANGED=""
+RDAP_EXPIRES=""
+RDAP_DNSSEC=""
+RDAP_REGISTRAR=""
+RDAP_NS_LIST=""
+
+# Propagation state (pipe-delimited lines: resolver|name|ips)
+PROP_ROWS=""
+
+# Colors (initialized after arg parsing)
+RED=""
+GREEN=""
+YELLOW=""
+CYAN=""
+BOLD=""
+DIM=""
+UNDER=""
+RESET=""
+OK="[OK]"
+ATT="[!]"
+FAIL="[ERR]"
+
+init_colors() {
+  if [[ "$NO_COLOR" -eq 0 && -t 1 && -z "${NO_COLOR:-}" && "$FORMAT" == "table" ]]; then
+    RED=$'\033[0;31m'
+    GREEN=$'\033[0;32m'
+    YELLOW=$'\033[0;33m'
+    CYAN=$'\033[0;36m'
+    BOLD=$'\033[1m'
+    DIM=$'\033[2m'
+    UNDER=$'\033[4m'
+    RESET=$'\033[0m'
+    OK="${GREEN}[OK]${RESET}"
+    ATT="${YELLOW}[!]${RESET}"
+    FAIL="${RED}[ERR]${RESET}"
+  else
+    RED="" GREEN="" YELLOW="" CYAN="" BOLD="" DIM="" UNDER="" RESET=""
+    OK="[OK]"
+    ATT="[!]"
+    FAIL="[ERR]"
   fi
-  if [ ! $PACKAGE_B ];
-    echo "[!] $SOCKET is not installed. Installing..."
-    apt install $SOCKET
+}
+
+show_help() {
+  cat <<'USAGE'
+vdns v2.0.0 — DNS & Registrar Diagnostic CLI (RDAP + Authoritative DNS)
+
+Usage:
+  vdns [options] <domain>
+  vdns -u | --update
+  vdns -V | --version
+  vdns -h | --help
+
+Lookup Options:
+  -a, --all                  Full lookup (registrar + DNS + mail + ping + Office SRV)
+  -n, --ns                   Nameservers, resolved IPs and parent zone NS
+  -d, --nsr                  Authoritative NS answer directly from domain NS
+  -w, --www                  A, AAAA and www A/CNAME records
+  -p, --ping                 ICMP reachability check (1 packet, 2s timeout)
+  -m, --mx                   MX records
+  -r, --reverse              Reverse DNS (PTR) for primary A record
+  -f, --spf                  SPF and DMARC TXT records
+  -k, --dkim                 DKIM TXT record (selector via --dkim-selector, default: default)
+  -o, --office               Microsoft 365 / Lync SRV records
+  -b, --br                   Registro.br RDAP lookup (.br domains)
+  -i, --intl                 Global RDAP lookup via rdap.org (non-.br domains)
+  -c, --registrar            Auto registrar lookup (.br -> Registro.br, other -> rdap.org)
+  -l, --propagation          Propagation check on Cloudflare, Google, Quad9, OpenDNS
+  -B, --bind                 BIND-style zone output ($ORIGIN + records)
+
+Output & Behavior Options:
+  -F, --format <fmt>         Output format: table (default), json, csv
+  --dkim-selector <name>     Custom DKIM selector (default: default)
+  --whois-fallback           Fallback to port-43 whois if RDAP is unreachable
+  --insecure                 Allow curl -k for RDAP TLS (off by default)
+  -s, --save                 Save clean (ANSI-free) output to <domain>.txt (chmod 600)
+  -q, --quiet                Suppress banner header
+  --no-color                 Disable ANSI colors
+  -u, --update               Check for newer vdns version on GitHub
+  -V, --version              Show version and exit
+  -h, --help                 Show this help and exit
+
+Examples:
+  vdns -a perciocastelo.com.br
+  vdns -b perciocastelo.com.br
+  vdns -c -F json example.com
+  vdns -a -l -F csv perciocastelo.com.br
+  vdns -k --dkim-selector google example.com
+  vdns -B perciocastelo.com.br
+USAGE
+}
+
+need_cmd() {
+  local missing=0 cmd
+  for cmd in "$@"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      printf '[ERR] Missing required command: %s\n' "$cmd" >&2
+      missing=1
+    fi
+  done
+  [[ "$missing" -eq 0 ]] || exit 1
+}
+
+normalize_domain() {
+  local raw="$1"
+  raw="${raw#http://}"
+  raw="${raw#https://}"
+  raw="${raw%%/*}"
+  raw="${raw%%:*}"
+  raw="${raw%.}"
+  raw="${raw,,}"
+  printf '%s' "$raw"
+}
+
+validate_domain() {
+  if [[ -z "$DOMAIN" || "${#DOMAIN}" -gt 253 ]] || \
+     ! printf '%s' "$DOMAIN" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*\.[a-z]{2,}$'; then
+    printf '%s Invalid domain: %s\n' "$FAIL" "${DOMAIN:-<empty>}" >&2
+    exit 1
   fi
-else
-  # Could not detect OS, exit with message
-  echo "Error: Could not identify OS. Exiting."
-  exit 1
-fi
+}
 
-# Check if package is installed
-if ! $PACKAGE_MANAGER $PACKAGE_CHECK | grep -o "$PACKAGE_NAME"; then
-  echo "$PACKAGE_NAME is not installed. Installing..."
-  sudo $PACKAGE_MANAGER install -y $PACKAGE_NAME
-else
-  echo "$PACKAGE_NAME is already installed."
-fi
+is_br_domain() {
+  [[ "$DOMAIN" == *.br ]]
+}
 
+find_psl_file() {
+  local file
+  for file in \
+    /usr/share/publicsuffix/public_suffix_list.dat \
+    /usr/share/misc/public_suffix_list.dat \
+    /usr/share/publicsuffix/effective_tld_names.dat \
+    /usr/share/publicsuffix/public_suffix_list.dat.txt \
+    /etc/public_suffix_list.dat; do
+    [[ -r "$file" ]] && { printf '%s\n' "$file"; return 0; }
+  done
+  return 1
+}
+
+psl_public_suffix() {
+  local d="$1"
+  [[ -z "$PSL_FILE" ]] && return 1
+  awk -v d="$d" '
+    BEGIN {
+      n = split(d, a, ".")
+      for (i = 1; i <= n; i++) {
+        s = a[i]
+        for (j = i + 1; j <= n; j++) s = s "." a[j]
+        cand[i] = s
+      }
+    }
+    /^[[:space:]]*$/ || /^\/\// { next }
+    {
+      rule = $0
+      gsub(/[[:space:]]+$/, "", rule)
+      gsub(/^[[:space:]]+/, "", rule)
+      if (rule ~ /^!/) { exc[substr(rule, 2)] = 1; next }
+      if (rule ~ /^\*\./) { wc[substr(rule, 3)] = 1; next }
+      exact[rule] = 1
+    }
+    END {
+      best = ""; bestn = 0
+      for (i = 1; i <= n; i++) {
+        s = cand[i]; matched = 0; out = ""
+        if (exact[s]) { matched = 1; out = s }
+        split(s, p, ".")
+        if (length(p) > 1) {
+          tail = substr(s, index(s, ".") + 1)
+          if (wc[tail]) { matched = 1; out = s }
+          if (exc[s]) { matched = 1; out = tail }
+        }
+        if (matched == 1) {
+          c = split(out, q, ".")
+          if (c > bestn) { best = out; bestn = c }
+        }
+      }
+      if (bestn > 0) print best
+    }
+  ' "$PSL_FILE"
+}
+
+compute_parent_zone() {
+  local d="$DOMAIN" tld sld suffix
+  suffix="$(psl_public_suffix "$d" 2>/dev/null || true)"
+  if [[ -n "$suffix" ]]; then
+    printf '%s' "$suffix"
+    return
+  fi
+  tld="${d##*.}"
+  sld="$(printf '%s' "$d" | awk -F. '{if (NF>=2) print $(NF-1)}')"
+  if [[ -n "$sld" && "${#tld}" -eq 2 ]] && printf '%s\n' "$sld" | grep -Eq '^(ac|co|com|edu|gov|gob|mil|net|nom|org|art|blog|dev|emp|eng|ind|inf|jus|leg|med|psi|rec|srv|tmp|tur|tv)$'; then
+    printf '%s.%s' "$sld" "$tld"
+  else
+    printf '%s' "$tld"
+  fi
+}
+
+check_update() {
+  local remote
+  remote="$(curl -fsSL --connect-timeout 5 --max-time 12 "$UPDATE_URL" 2>/dev/null | grep -m1 -E '^(readonly )?VERSION=' | cut -d '"' -f2 || true)"
+  if [[ -z "$remote" ]]; then
+    printf '%s Could not check remote version at %s\n' "$ATT" "$UPDATE_URL"
+    exit 1
+  fi
+  if [[ "$VERSION" != "$remote" ]]; then
+    printf '%s New vdns version available: %s (current: %s)\n' "$ATT" "$remote" "$VERSION"
+  else
+    printf '%s vdns is up to date (%s)\n' "$OK" "$VERSION"
+  fi
+}
+
+rdap_fetch() {
+  local url="$1"
+  local out
+  local -a opts=(
+    -sS -L
+    --connect-timeout 5
+    --max-time 10
+    -H 'Accept: application/rdap+json, application/json;q=0.9'
+    -w $'\n%{http_code}'
+  )
+  [[ "$INSECURE_TLS" -eq 1 ]] && opts+=(-k)
+
+  RDAP_BODY=""
+  RDAP_CODE="000"
+  RDAP_URL="$url"
+
+  out="$(curl "${opts[@]}" "$url" 2>/dev/null || true)"
+  if [[ -z "$out" ]]; then
+    return 1
+  fi
+
+  RDAP_CODE="${out##*$'\n'}"
+  RDAP_BODY="${out%$'\n'*}"
+
+  # Retry once with browser-like headers if WAF returns 403
+  if [[ "$RDAP_CODE" == "403" ]]; then
+    out="$(curl -sS -L --connect-timeout 5 --max-time 10 \
+      -A "$RDAP_UA" \
+      -H 'Accept: application/rdap+json, application/json;q=0.9,*/*;q=0.8' \
+      -H 'Accept-Language: pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7' \
+      -H 'Referer: https://registro.br/' \
+      $([[ "$INSECURE_TLS" -eq 1 ]] && printf '%s' '-k') \
+      -w $'\n%{http_code}' \
+      "$url" 2>/dev/null || true)"
+    if [[ -n "$out" ]]; then
+      RDAP_CODE="${out##*$'\n'}"
+      RDAP_BODY="${out%$'\n'*}"
+    fi
+  fi
+
+  return 0
+}
+
+rdap_parse_json() {
+  RDAP_LDH=""
+  RDAP_DOM_STATUS=""
+  RDAP_CREATED=""
+  RDAP_CHANGED=""
+  RDAP_EXPIRES=""
+  RDAP_DNSSEC=""
+  RDAP_REGISTRAR=""
+  RDAP_NS_LIST=""
+
+  local parsed=""
+  if [[ "$HAVE_JQ" -eq 1 ]]; then
+    parsed="$(jq -r '
+      def ev($act): ([.events[]? | select(.eventAction == $act) | .eventDate][0] // "");
+      def vcard_fn:
+        (.vcardArray[1]? // [] | map(select(.[0] == "fn") | .[3]) | .[0] // "");
+      def entity_by_role($r):
+        ([.entities[]? | select((.roles // []) | index($r)) | vcard_fn | select(length > 0)][0] // "");
+      [
+        (.ldhName // ""),
+        ((.status // []) | join(", ")),
+        ev("registration"),
+        ev("last changed"),
+        ev("expiration"),
+        (if .secureDNS.delegationSigned == true then "signed"
+         elif .secureDNS.delegationSigned == false then "unsigned"
+         else "" end),
+        (entity_by_role("registrar") | if length > 0 then . else entity_by_role("registrant") end),
+        ([.nameservers[]?.ldhName // empty] | join(", "))
+      ] | join("\t")
+    ' 2>/dev/null <<<"$RDAP_BODY" || true)"
+  elif [[ "$HAVE_PY3" -eq 1 ]]; then
+    parsed="$(python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+ldh = d.get("ldhName") or ""
+status = ", ".join(d.get("status") or [])
+events = {e.get("eventAction", ""): e.get("eventDate", "") for e in (d.get("events") or []) if isinstance(e, dict)}
+created = events.get("registration", "")
+changed = events.get("last changed", "")
+expires = events.get("expiration", "")
+sdns = d.get("secureDNS") or {}
+if sdns.get("delegationSigned") is True:
+    dnssec = "signed"
+elif sdns.get("delegationSigned") is False:
+    dnssec = "unsigned"
+else:
+    dnssec = ""
+def find_role(role):
+    for ent in (d.get("entities") or []):
+        if role in (ent.get("roles") or []):
+            vc = ent.get("vcardArray")
+            if isinstance(vc, list) and len(vc) > 1 and isinstance(vc[1], list):
+                for item in vc[1]:
+                    if isinstance(item, list) and len(item) >= 4 and item[0] == "fn" and item[3]:
+                        return str(item[3])
+    return ""
+owner = find_role("registrar") or find_role("registrant")
+ns_list = ", ".join(n.get("ldhName", "") for n in (d.get("nameservers") or []) if isinstance(n, dict) and n.get("ldhName"))
+print("\t".join([ldh, status, created, changed, expires, dnssec, owner, ns_list]).replace("\n", " "))
+' 2>/dev/null <<<"$RDAP_BODY" || true)"
+  fi
+
+  if [[ -n "$parsed" ]]; then
+    IFS=$'\t' read -r RDAP_LDH RDAP_DOM_STATUS RDAP_CREATED RDAP_CHANGED RDAP_EXPIRES RDAP_DNSSEC RDAP_REGISTRAR RDAP_NS_LIST <<<"$parsed"
+  else
+    # Minimal POSIX fallback without jq/python3
+    RDAP_LDH="$(printf '%s' "$RDAP_BODY" | grep -oE '"ldhName"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 | sed -E 's/.*"([^"]+)"$/\1/' || true)"
+    RDAP_DOM_STATUS="$(printf '%s' "$RDAP_BODY" | grep -oE '"status"[[:space:]]*:[[:space:]]*\[[^]]+\]' | head -n1 | sed -E 's/.*\[(.*)\]/\1/; s/"//g' || true)"
+  fi
+}
+
+rdap_body_error_code() {
+  if [[ "$HAVE_JQ" -eq 1 ]]; then
+    jq -r '(.errorCode // empty) | tostring' 2>/dev/null <<<"$RDAP_BODY" || true
+    return
+  fi
+  printf '%s' "$RDAP_BODY" | grep -oE '"errorCode"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -n1 || true
+}
+
+whois_fallback_check() {
+  if ! command -v whois >/dev/null 2>&1; then
+    return 1
+  fi
+  local raw server=""
+  if is_br_domain; then
+    server="-h whois.registro.br"
+  fi
+  # shellcheck disable=SC2086
+  raw="$(whois $server "$DOMAIN" 2>/dev/null || true)"
+  [[ -z "$raw" ]] && return 1
+  if printf '%s' "$raw" | grep -Eqi 'No match for|NOT FOUND|No entries found'; then
+    RDAP_STATUS_STATE="unregistered"
+    RDAP_MSG="${DOMAIN} appears unregistered (WHOIS fallback)."
+    return 0
+  fi
+  RDAP_STATUS_STATE="registered"
+  RDAP_SOURCE="${RDAP_SOURCE}+whois"
+  RDAP_LDH="$DOMAIN"
+  RDAP_DOM_STATUS="$(printf '%s\n' "$raw" | awk -F: '/^status:/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')"
+  RDAP_EXPIRES="$(printf '%s\n' "$raw" | awk -F: '/^expires:/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')"
+  RDAP_MSG="${DOMAIN} is registered (WHOIS fallback)."
+  return 0
+}
+
+query_registrar() {
+  local mode="$1" # br | intl
+  local endpoint=""
+  if [[ "$mode" == "br" ]]; then
+    if ! is_br_domain; then
+      RDAP_STATUS_STATE="not_applicable"
+      RDAP_MSG="${DOMAIN} is not a .br domain."
+      return
+    fi
+    endpoint="${REG_BR_RDAP}${DOMAIN}"
+    RDAP_SOURCE="registro.br-rdap"
+  else
+    if is_br_domain; then
+      return
+    fi
+    endpoint="${GLOBAL_RDAP}${DOMAIN}"
+    RDAP_SOURCE="rdap.org"
+  fi
+
+  if ! rdap_fetch "$endpoint"; then
+    if [[ "$WHOIS_FALLBACK" -eq 1 ]] && whois_fallback_check; then
+      return
+    fi
+    RDAP_STATUS_STATE="error"
+    RDAP_MSG="RDAP unreachable (${endpoint}). Check egress/DNS or try --whois-fallback."
+    return
+  fi
+
+  local body_code
+  body_code="$(rdap_body_error_code)"
+
+  if [[ "$RDAP_CODE" == "404" || "$body_code" == "404" ]]; then
+    RDAP_STATUS_STATE="unregistered"
+    RDAP_MSG="${DOMAIN} appears unregistered (RDAP HTTP 404)."
+    return
+  fi
+
+  if [[ "$RDAP_CODE" == "429" ]]; then
+    RDAP_STATUS_STATE="rate_limited"
+    RDAP_MSG="RDAP rate limited (HTTP 429) at ${endpoint}."
+    return
+  fi
+
+  if [[ "$RDAP_CODE" == "403" ]]; then
+    if [[ "$WHOIS_FALLBACK" -eq 1 ]] && whois_fallback_check; then
+      return
+    fi
+    RDAP_STATUS_STATE="blocked"
+    RDAP_MSG="RDAP blocked with HTTP 403 at ${endpoint}."
+    return
+  fi
+
+  if [[ "$RDAP_CODE" != "200" ]]; then
+    if [[ "$WHOIS_FALLBACK" -eq 1 ]] && whois_fallback_check; then
+      return
+    fi
+    RDAP_STATUS_STATE="error"
+    RDAP_MSG="RDAP query failed (HTTP ${RDAP_CODE}) at ${endpoint}."
+    return
+  fi
+
+  rdap_parse_json
+  if [[ -n "$RDAP_LDH" ]]; then
+    RDAP_STATUS_STATE="registered"
+    RDAP_MSG="${DOMAIN} is registered (${RDAP_SOURCE})."
+  else
+    RDAP_STATUS_STATE="unknown"
+    RDAP_MSG="RDAP returned HTTP 200 without ldhName (${endpoint})."
+  fi
+}
+
+run_dns_queries() {
+  PARENT_ZONE="$(compute_parent_zone)"
+  ROOTS="$(dig +time=3 +tries=1 +short NS "$PARENT_ZONE" 2>/dev/null | sed 's/\.$//' | sort -u || true)"
+  SRV="$(dig +time=3 +tries=1 +short NS "$DOMAIN" 2>/dev/null | sed 's/\.$//' | head -n1 || true)"
+
+  if [[ -n "$SRV" ]]; then
+    NAMESERVER="$(dig +time=3 +tries=1 +noall +answer NS "$DOMAIN" @"$SRV" 2>/dev/null | sed 's/\.$//' || true)"
+    A_REC="$(dig +time=3 +tries=1 +short A "$DOMAIN" @"$SRV" 2>/dev/null | grep -E '^[0-9.]+$' | head -n1 || true)"
+    MX_REC="$(dig +time=3 +tries=1 +noall +answer MX "$DOMAIN" @"$SRV" 2>/dev/null | sed 's/\.$//' || true)"
+    SPF_REC="$(dig +time=3 +tries=1 +short TXT "$DOMAIN" @"$SRV" 2>/dev/null | grep -i 'v=spf1' || true)"
+    DKIM_REC="$(dig +time=3 +tries=1 +short TXT "${DKIM_SELECTOR}._domainkey.${DOMAIN}" @"$SRV" 2>/dev/null || true)"
+  fi
+
+  [[ -z "$NAMESERVER" ]] && NAMESERVER="$(dig +time=3 +tries=1 +noall +answer NS "$DOMAIN" 2>/dev/null | sed 's/\.$//' || true)"
+  [[ -z "$A_REC" ]] && A_REC="$(dig +time=3 +tries=1 +short A "$DOMAIN" 2>/dev/null | grep -E '^[0-9.]+$' | head -n1 || true)"
+  [[ -z "$MX_REC" ]] && MX_REC="$(dig +time=3 +tries=1 +noall +answer MX "$DOMAIN" 2>/dev/null | sed 's/\.$//' || true)"
+  [[ -z "$SPF_REC" ]] && SPF_REC="$(dig +time=3 +tries=1 +short TXT "$DOMAIN" 2>/dev/null | grep -i 'v=spf1' || true)"
+  [[ -z "$DKIM_REC" ]] && DKIM_REC="$(dig +time=3 +tries=1 +short TXT "${DKIM_SELECTOR}._domainkey.${DOMAIN}" 2>/dev/null || true)"
+
+  NS_LIST="$(printf '%s\n' "$NAMESERVER" | awk '/IN[[:space:]]+NS/ {print $NF}' | sed 's/\.$//' | sort -u || true)"
+  AAAA_REC="$(dig +time=3 +tries=1 +short AAAA "$DOMAIN" 2>/dev/null | head -n1 || true)"
+  WWW_A="$(dig +time=3 +tries=1 +short A "www.${DOMAIN}" 2>/dev/null | grep -E '^[0-9.]+$' | paste -sd ',' - || true)"
+  WWW_CNAME="$(dig +time=3 +tries=1 +short CNAME "www.${DOMAIN}" 2>/dev/null | sed 's/\.$//' | head -n1 || true)"
+  DMARC_REC="$(dig +time=3 +tries=1 +short TXT "_dmarc.${DOMAIN}" 2>/dev/null | grep -i 'v=DMARC1' || true)"
+
+  if [[ -n "$A_REC" ]]; then
+    REVERSE_PTR="$(dig +time=3 +tries=1 +short -x "$A_REC" 2>/dev/null | sed 's/\.$//' | paste -sd ',' - || true)"
+  fi
+
+  OFFICE_SRV1="$(dig +time=3 +tries=1 +short SRV "_sipfederationtls._tcp.${DOMAIN}" 2>/dev/null || true)"
+  OFFICE_SRV2="$(dig +time=3 +tries=1 +short SRV "_sip._tls.${DOMAIN}" 2>/dev/null || true)"
+
+  if [[ "$DO_PING" -eq 1 ]]; then
+    if command -v ping >/dev/null 2>&1; then
+      if ping -q -c 1 -W 2 "$DOMAIN" >/dev/null 2>&1; then
+        VPING="ok"
+      else
+        VPING="fail"
+      fi
+    else
+      VPING="missing"
+    fi
+  fi
+
+  if [[ "$DO_PROP" -eq 1 ]]; then
+    local resolver name ips
+    PROP_ROWS=""
+    while read -r resolver name; do
+      ips="$(dig +time=3 +tries=1 +short A "$DOMAIN" @"$resolver" 2>/dev/null | grep -E '^[0-9.]+$' | paste -sd ',' - || true)"
+      PROP_ROWS+="${resolver}|${name}|${ips:-none}"$'\n'
+    done <<'EOFRES'
+1.1.1.1 Cloudflare
+8.8.8.8 Google
+9.9.9.9 Quad9
+208.67.222.222 OpenDNS
+EOFRES
+  fi
+}
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+csv_escape() {
+  local s="$1"
+  s="${s//$'\n'/ ; }"
+  s="${s//$'\r'/}"
+  s="${s//\"/\"\"}"
+  printf '"%s"' "$s"
+}
+
+render_registrar_table() {
+  printf '\n%s---- REGISTRAR (RDAP) ----%s\n' "$UNDER" "$RESET"
+  case "$RDAP_STATUS_STATE" in
+    registered)   printf '%s %s\n' "$OK" "$RDAP_MSG" ;;
+    unregistered|not_applicable|unknown|rate_limited) printf '%s %s\n' "$ATT" "$RDAP_MSG" ;;
+    *)            printf '%s %s\n' "$FAIL" "$RDAP_MSG" ;;
+  esac
+  [[ -n "$RDAP_URL" ]]        && printf '  Endpoint   : %s (HTTP %s)\n' "$RDAP_URL" "$RDAP_CODE"
+  [[ -n "$RDAP_DOM_STATUS" ]] && printf '  Status     : %s\n' "$RDAP_DOM_STATUS"
+  [[ -n "$RDAP_CREATED" ]]    && printf '  Registered : %s\n' "$RDAP_CREATED"
+  [[ -n "$RDAP_CHANGED" ]]    && printf '  Updated    : %s\n' "$RDAP_CHANGED"
+  [[ -n "$RDAP_EXPIRES" ]]    && printf '  Expires    : %s\n' "$RDAP_EXPIRES"
+  [[ -n "$RDAP_DNSSEC" ]]     && printf '  DNSSEC     : %s\n' "$RDAP_DNSSEC"
+  [[ -n "$RDAP_REGISTRAR" ]]  && printf '  Entity     : %s\n' "$RDAP_REGISTRAR"
+  [[ -n "$RDAP_NS_LIST" ]]    && printf '  Delegated  : %s\n' "$RDAP_NS_LIST"
+}
+
+render_table() {
+  if [[ "$QUIET" -eq 0 ]]; then
+    printf '%s=====================================================%s\n' "$CYAN" "$RESET"
+    printf ' %svdns v%s%s | Domain: %s%s%s | %s\n' "$BOLD" "$VERSION" "$RESET" "$BOLD" "$DOMAIN" "$RESET" "$TIMESTAMP_UTC"
+    printf '%s=====================================================%s\n' "$CYAN" "$RESET"
+  fi
+
+  if [[ "$DO_BR" -eq 1 || "$DO_INT" -eq 1 ]]; then
+    render_registrar_table
+  fi
+
+  if [[ "$DO_NS" -eq 1 ]]; then
+    printf '\n%s---- NS ------------------%s\n' "$UNDER" "$RESET"
+    if [[ -z "$NS_LIST" ]]; then
+      printf '%s Unable to obtain nameservers for %s.\n' "$FAIL" "$DOMAIN"
+    else
+      printf '%s Nameservers for %s:\n' "$OK" "$DOMAIN"
+      local ns ip
+      while IFS= read -r ns; do
+        [[ -z "$ns" ]] && continue
+        ip="$(dig +time=3 +tries=1 +short A "$ns" 2>/dev/null | grep -E '^[0-9.]+$' | paste -sd ',' - || true)"
+        printf '  - %s %s\n' "$ns" "${ip:+($ip)}"
+      done <<<"$NS_LIST"
+    fi
+    if [[ -n "$ROOTS" ]]; then
+      printf '%s Parent zone NS (%s -> %s):\n' "$OK" "$DOMAIN" "$PARENT_ZONE"
+      while IFS= read -r ns; do
+        [[ -z "$ns" ]] && continue
+        printf '  - %s\n' "$ns"
+      done <<<"$ROOTS"
+    fi
+  fi
+
+  if [[ "$DO_DNS" -eq 1 ]]; then
+    printf '\n%s---- NSR (AUTHORITATIVE) --%s\n' "$UNDER" "$RESET"
+    if [[ -z "$NAMESERVER" ]]; then
+      printf '%s Unable to get authoritative NS records.\n' "$FAIL"
+    else
+      printf '%s Authoritative NS answer (via %s):\n' "$OK" "${SRV:-local-resolver}"
+      printf '%s\n' "$NAMESERVER"
+    fi
+  fi
+
+  if [[ "$DO_WWW" -eq 1 ]]; then
+    printf '\n%s---- WWW / IP ------------%s\n' "$UNDER" "$RESET"
+    if [[ -z "$A_REC" && -z "$AAAA_REC" && -z "$WWW_A" && -z "$WWW_CNAME" ]]; then
+      printf '%s No A/AAAA/CNAME records found for %s or www.%s.\n' "$FAIL" "$DOMAIN" "$DOMAIN"
+    else
+      [[ -n "$A_REC" ]]     && printf '%s A (%s): %s\n' "$OK" "$DOMAIN" "$A_REC"
+      [[ -n "$AAAA_REC" ]]  && printf '%s AAAA (%s): %s\n' "$OK" "$DOMAIN" "$AAAA_REC"
+      [[ -n "$WWW_CNAME" ]] && printf '%s CNAME (www.%s): %s\n' "$OK" "$DOMAIN" "$WWW_CNAME"
+      [[ -n "$WWW_A" ]]     && printf '%s A (www.%s): %s\n' "$OK" "$DOMAIN" "$WWW_A"
+    fi
+  fi
+
+  if [[ "$DO_PING" -eq 1 ]]; then
+    printf '\n%s---- PING ----------------%s\n' "$UNDER" "$RESET"
+    case "$VPING" in
+      ok)   printf '%s %s replied to ICMP ping.\n' "$OK" "$DOMAIN" ;;
+      fail) printf '%s %s did not reply to ICMP ping.\n' "$ATT" "$DOMAIN" ;;
+      *)    printf '%s ping command not found; skipping.\n' "$ATT" ;;
+    esac
+  fi
+
+  if [[ "$DO_MX" -eq 1 ]]; then
+    printf '\n%s---- MX ------------------%s\n' "$UNDER" "$RESET"
+    if [[ -z "$MX_REC" ]]; then
+      printf '%s No MX records found.\n' "$ATT"
+    else
+      printf '%s\n' "$MX_REC"
+    fi
+  fi
+
+  if [[ "$DO_REVERSE" -eq 1 ]]; then
+    printf '\n%s---- REVERSE (PTR) -------%s\n' "$UNDER" "$RESET"
+    if [[ -z "$A_REC" ]]; then
+      printf '%s No A record found; PTR lookup skipped.\n' "$ATT"
+    elif [[ -z "$REVERSE_PTR" ]]; then
+      printf '%s No PTR record found for %s.\n' "$ATT" "$A_REC"
+    else
+      printf '%s PTR for %s: %s\n' "$OK" "$A_REC" "$REVERSE_PTR"
+    fi
+  fi
+
+  if [[ "$DO_SPF" -eq 1 ]]; then
+    printf '\n%s---- SPF & DMARC ---------%s\n' "$UNDER" "$RESET"
+    if [[ -z "$SPF_REC" ]]; then
+      printf '%s No SPF record found.\n' "$ATT"
+    else
+      printf '%s SPF: %s\n' "$OK" "$SPF_REC"
+    fi
+    if [[ -z "$DMARC_REC" ]]; then
+      printf '%s No DMARC record found (_dmarc.%s).\n' "$ATT" "$DOMAIN"
+    else
+      printf '%s DMARC: %s\n' "$OK" "$DMARC_REC"
+    fi
+  fi
+
+  if [[ "$DO_DKIM" -eq 1 ]]; then
+    printf '\n%s---- DKIM (%s) -------%s\n' "$UNDER" "$DKIM_SELECTOR" "$RESET"
+    if [[ -z "$DKIM_REC" ]]; then
+      printf '%s DKIM record not found (%s._domainkey.%s).\n' "$ATT" "$DKIM_SELECTOR" "$DOMAIN"
+    else
+      printf '%s %s\n' "$OK" "$DKIM_REC"
+    fi
+  fi
+
+  if [[ "$DO_OFFICE" -eq 1 ]]; then
+    printf '\n%s---- OFFICE SRV ----------%s\n' "$UNDER" "$RESET"
+    if [[ -z "$OFFICE_SRV1" && -z "$OFFICE_SRV2" ]]; then
+      printf '%s No Office/Lync SRV records found.\n' "$ATT"
+    else
+      [[ -n "$OFFICE_SRV1" ]] && printf '%s\n' "$OFFICE_SRV1"
+      [[ -n "$OFFICE_SRV2" ]] && printf '%s\n' "$OFFICE_SRV2"
+    fi
+  fi
+
+  if [[ "$DO_BIND" -eq 1 ]]; then
+    printf '\n%s---- BIND ZONE -----------%s\n' "$UNDER" "$RESET"
+    printf '$ORIGIN %s.\n' "$DOMAIN"
+    local t
+    for t in SOA NS A AAAA MX TXT CNAME; do
+      dig +time=3 +tries=1 +noall +answer "$DOMAIN" "$t" 2>/dev/null || true
+    done
+    dig +time=3 +tries=1 +noall +answer "www.${DOMAIN}" A 2>/dev/null || true
+    dig +time=3 +tries=1 +noall +answer "www.${DOMAIN}" CNAME 2>/dev/null || true
+  fi
+
+  if [[ "$DO_PROP" -eq 1 ]]; then
+    printf '\n%s---- PROPAGATION ---------%s\n' "$UNDER" "$RESET"
+    local resolver name ips
+    while IFS='|' read -r resolver name ips; do
+      [[ -z "$resolver" ]] && continue
+      printf '  %-12s (%-15s): %s\n' "$name" "$resolver" "$ips"
+    done <<<"$PROP_ROWS"
+  fi
+}
+
+render_json() {
+  local ns_csv mx_flat prop_json=""
+  ns_csv="$(printf '%s' "$NS_LIST" | paste -sd ',' - || true)"
+  mx_flat="$(printf '%s' "$MX_REC" | tr '\n' ';' | sed 's/;$//' || true)"
+
+  if [[ -n "$PROP_ROWS" ]]; then
+    local resolver name ips first=1
+    while IFS='|' read -r resolver name ips; do
+      [[ -z "$resolver" ]] && continue
+      [[ "$first" -eq 0 ]] && prop_json+=","
+      first=0
+      prop_json+="{\"resolver\":\"$(json_escape "$resolver")\",\"name\":\"$(json_escape "$name")\",\"a\":\"$(json_escape "$ips")\"}"
+    done <<<"$PROP_ROWS"
+  fi
+
+  cat <<EOF
+{
+  "tool": "${SCRIPT_NAME}",
+  "version": "${VERSION}",
+  "timestamp": "$(json_escape "$TIMESTAMP_UTC")",
+  "domain": "$(json_escape "$DOMAIN")",
+  "parent_zone": "$(json_escape "$PARENT_ZONE")",
+  "registrar": {
+    "source": "$(json_escape "$RDAP_SOURCE")",
+    "endpoint": "$(json_escape "$RDAP_URL")",
+    "http_code": "$(json_escape "$RDAP_CODE")",
+    "state": "$(json_escape "$RDAP_STATUS_STATE")",
+    "status": "$(json_escape "$RDAP_DOM_STATUS")",
+    "registered": "$(json_escape "$RDAP_CREATED")",
+    "updated": "$(json_escape "$RDAP_CHANGED")",
+    "expires": "$(json_escape "$RDAP_EXPIRES")",
+    "dnssec": "$(json_escape "$RDAP_DNSSEC")",
+    "entity": "$(json_escape "$RDAP_REGISTRAR")",
+    "delegated_ns": "$(json_escape "$RDAP_NS_LIST")"
+  },
+  "dns": {
+    "nameservers": "$(json_escape "$ns_csv")",
+    "a": "$(json_escape "$A_REC")",
+    "aaaa": "$(json_escape "$AAAA_REC")",
+    "www_a": "$(json_escape "$WWW_A")",
+    "www_cname": "$(json_escape "$WWW_CNAME")",
+    "ptr": "$(json_escape "$REVERSE_PTR")",
+    "mx": "$(json_escape "$mx_flat")",
+    "spf": "$(json_escape "$SPF_REC")",
+    "dmarc": "$(json_escape "$DMARC_REC")",
+    "dkim_selector": "$(json_escape "$DKIM_SELECTOR")",
+    "dkim": "$(json_escape "$DKIM_REC")",
+    "ping": "$(json_escape "$VPING")"
+  },
+  "propagation": [${prop_json}]
+}
+EOF
+}
+
+render_csv() {
+  printf 'domain,parent_zone,rdap_state,rdap_http,rdap_status,rdap_expires,dnssec,a,aaaa,www_a,ptr,nameservers,ping\n'
+  local ns_csv
+  ns_csv="$(printf '%s' "$NS_LIST" | paste -sd ';' - || true)"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$(csv_escape "$DOMAIN")" \
+    "$(csv_escape "$PARENT_ZONE")" \
+    "$(csv_escape "$RDAP_STATUS_STATE")" \
+    "$(csv_escape "$RDAP_CODE")" \
+    "$(csv_escape "$RDAP_DOM_STATUS")" \
+    "$(csv_escape "$RDAP_EXPIRES")" \
+    "$(csv_escape "$RDAP_DNSSEC")" \
+    "$(csv_escape "$A_REC")" \
+    "$(csv_escape "$AAAA_REC")" \
+    "$(csv_escape "$WWW_A")" \
+    "$(csv_escape "$REVERSE_PTR")" \
+    "$(csv_escape "$ns_csv")" \
+    "$(csv_escape "$VPING")"
+}
+
+main() {
+  need_cmd dig curl awk sed grep sort cut paste
+  command -v jq >/dev/null 2>&1 && HAVE_JQ=1
+  command -v python3 >/dev/null 2>&1 && HAVE_PY3=1
+  PSL_FILE="$(find_psl_file 2>/dev/null || true)"
+
+  [[ "$#" -eq 0 ]] && { printf 'No arguments provided. Use -h for help.\n' >&2; exit 1; }
+
+  # Pre-parse long options into positional/short equivalents
+  local -a args=()
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --help)           args+=("-h"); shift ;;
+      --version)        args+=("-V"); shift ;;
+      --update)         args+=("-u"); shift ;;
+      --all)            args+=("-a"); shift ;;
+      --ns)             args+=("-n"); shift ;;
+      --nsr)            args+=("-d"); shift ;;
+      --www)            args+=("-w"); shift ;;
+      --ping)           args+=("-p"); shift ;;
+      --mx)             args+=("-m"); shift ;;
+      --reverse)        args+=("-r"); shift ;;
+      --spf)            args+=("-f"); shift ;;
+      --dkim)           args+=("-k"); shift ;;
+      --office)         args+=("-o"); shift ;;
+      --br)             args+=("-b"); shift ;;
+      --intl)           args+=("-i"); shift ;;
+      --registrar)      args+=("-c"); shift ;;
+      --propagation)    args+=("-l"); shift ;;
+      --bind)           args+=("-B"); shift ;;
+      --save)           args+=("-s"); shift ;;
+      --quiet)          args+=("-q"); shift ;;
+      --no-color)       NO_COLOR=1; shift ;;
+      --insecure)       INSECURE_TLS=1; shift ;;
+      --whois-fallback) WHOIS_FALLBACK=1; shift ;;
+      --json)           FORMAT="json"; shift ;;
+      --csv)            FORMAT="csv"; shift ;;
+      --format)
+        [[ $# -lt 2 ]] && { printf '[ERR] --format requires an argument (table|json|csv)\n' >&2; exit 1; }
+        FORMAT="$2"; shift 2 ;;
+      --format=*)
+        FORMAT="${1#*=}"; shift ;;
+      --dkim-selector)
+        [[ $# -lt 2 ]] && { printf '[ERR] --dkim-selector requires an argument\n' >&2; exit 1; }
+        DKIM_SELECTOR="$2"; shift 2 ;;
+      --dkim-selector=*)
+        DKIM_SELECTOR="${1#*=}"; shift ;;
+      --)
+        shift
+        while [[ "$#" -gt 0 ]]; do args+=("$1"); shift; done ;;
+      --*)
+        printf '[ERR] Unknown option: %s\n' "$1" >&2; exit 1 ;;
+      *)
+        args+=("$1"); shift ;;
+    esac
+  done
+
+  set -- "${args[@]}"
+
+  local opt
+  while getopts ":haBndwpmrkfsbiocluVqF:" opt; do
+    case "$opt" in
+      h) show_help; exit 0 ;;
+      V) printf '%s %s\n' "$SCRIPT_NAME" "$VERSION"; exit 0 ;;
+      u) init_colors; check_update; exit 0 ;;
+      a) DO_ALL=1 ;;
+      B) DO_BIND=1 ;;
+      n) DO_NS=1 ;;
+      d) DO_DNS=1 ;;
+      w) DO_WWW=1 ;;
+      p) DO_PING=1 ;;
+      m) DO_MX=1 ;;
+      r) DO_REVERSE=1 ;;
+      f) DO_SPF=1 ;;
+      k) DO_DKIM=1 ;;
+      b) DO_BR=1 ;;
+      i) DO_INT=1 ;;
+      o) DO_OFFICE=1 ;;
+      c) DO_BR=1; DO_INT=1 ;;
+      l) DO_PROP=1 ;;
+      s) DO_SAVE=1 ;;
+      q) QUIET=1 ;;
+      F) FORMAT="$OPTARG" ;;
+      :) printf '[ERR] Missing argument for -%s\n' "$OPTARG" >&2; exit 1 ;;
+      \?) printf '[ERR] Invalid option: -%s\n' "$OPTARG" >&2; exit 1 ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+
+  case "$FORMAT" in
+    table|json|csv) ;;
+    *) printf '[ERR] Invalid format: %s (expected table, json, or csv)\n' "$FORMAT" >&2; exit 1 ;;
+  esac
+
+  init_colors
+
+  if [[ -z "${1:-}" ]]; then
+    printf '%s Please provide a domain. Use -h for help.\n' "$FAIL" >&2
+    exit 1
+  fi
+
+  DOMAIN="$(normalize_domain "$1")"
+  validate_domain
+
+  if [[ "$DO_ALL" -eq 0 && "$DO_NS" -eq 0 && "$DO_DNS" -eq 0 && \
+        "$DO_WWW" -eq 0 && "$DO_PING" -eq 0 && "$DO_MX" -eq 0 && \
+        "$DO_REVERSE" -eq 0 && "$DO_SPF" -eq 0 && "$DO_DKIM" -eq 0 && \
+        "$DO_BR" -eq 0 && "$DO_INT" -eq 0 && "$DO_OFFICE" -eq 0 && \
+        "$DO_BIND" -eq 0 && "$DO_PROP" -eq 0 ]]; then
+    DO_ALL=1
+  fi
+
+  if [[ "$DO_ALL" -eq 1 ]]; then
+    DO_NS=1; DO_DNS=1; DO_WWW=1; DO_PING=1; DO_MX=1
+    DO_REVERSE=1; DO_SPF=1; DO_DKIM=1; DO_BR=1; DO_INT=1; DO_OFFICE=1
+  fi
+
+  # Execute registrar queries
+  if [[ "$DO_BR" -eq 1 && "$DO_INT" -eq 1 ]]; then
+    if is_br_domain; then
+      query_registrar br
+    else
+      query_registrar intl
+    fi
+  elif [[ "$DO_BR" -eq 1 ]]; then
+    query_registrar br
+  elif [[ "$DO_INT" -eq 1 ]]; then
+    query_registrar intl
+  fi
+
+  # Execute DNS queries if any DNS section requested
+  if [[ "$DO_NS" -eq 1 || "$DO_DNS" -eq 1 || "$DO_WWW" -eq 1 || \
+        "$DO_PING" -eq 1 || "$DO_MX" -eq 1 || "$DO_REVERSE" -eq 1 || \
+        "$DO_SPF" -eq 1 || "$DO_DKIM" -eq 1 || "$DO_OFFICE" -eq 1 || \
+        "$DO_BIND" -eq 1 || "$DO_PROP" -eq 1 ]]; then
+    run_dns_queries
+  fi
+
+  local output=""
+  case "$FORMAT" in
+    table) output="$(render_table)" ;;
+    json)  output="$(render_json)" ;;
+    csv)   output="$(render_csv)" ;;
+  esac
+
+  printf '%s\n' "$output"
+
+  if [[ "$DO_SAVE" -eq 1 ]]; then
+    SAVE_FILE="${DOMAIN}.txt"
+    (
+      umask 077
+      # Strip ANSI escape sequences when saving to disk
+      printf '%s\n' "$output" | sed -E 's/\x1B\[[0-9;]*[mK]//g' > "$SAVE_FILE"
+    )
+    chmod 600 "$SAVE_FILE"
+    if [[ "$FORMAT" == "table" ]]; then
+      printf '\n%s Output saved to %s/%s (chmod 600)\n' "$OK" "$(pwd)" "$SAVE_FILE"
+    fi
+  fi
+}
+
+main "$@"
