@@ -94,6 +94,26 @@ vdns -a -s example.com
 | `-V`, `--version` | Show version and exit |
 | `-h`, `--help` | Show help and exit |
 
+## Direct Execution & Windows PowerShell
+
+### Linux / macOS (Direct Execution)
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/sr00t3d/vdns/main/vdns) -a example.com
+```
+
+### Windows (PowerShell `vdns.ps1`)
+Zero external dependencies — works natively on **Windows PowerShell 5.1+** and **PowerShell 7+**:
+
+```powershell
+# Direct execution (no clone required)
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/sr00t3d/vdns/main/vdns.ps1))) -All example.com
+
+# Local execution
+.\vdns.ps1 -All perciocastelo.com.br
+.\vdns.ps1 -Registrar -Dns -Propagation example.com -Output json
+.\vdns.ps1 -All github.io -Output csv
+```
+
 ## Real Output Example
 
 ### Registro.br RDAP + Full DNS Lookup (`vdns -a --no-color perciocastelo.com.br`)
@@ -181,13 +201,3 @@ perciocastelo.com.br.	600	IN	MX	50 mx3.zoho.com
 Licensed under the [Apache License 2.0](LICENSE).
 
 Português: [README-ptbr.md](README-ptbr.md)
-
-## Windows (PowerShell `vdns.ps1`)
-
-Zero external dependencies — uses native `Resolve-DnsName`, RDAP HTTPS, and `.NET TcpClient` WHOIS fallback on **Windows PowerShell 5.1** and **PowerShell 7+**:
-
-```powershell
-.\vdns.ps1 -All perciocastelo.com.br
-.\vdns.ps1 -Registrar -Dns -Propagation example.com -Output json
-.\vdns.ps1 -All github.io -Output csv
-```
