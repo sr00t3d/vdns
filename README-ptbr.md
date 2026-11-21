@@ -181,3 +181,13 @@ perciocastelo.com.br.	600	IN	MX	50 mx3.zoho.com
 Licenciado sob a [Apache License 2.0](LICENSE).
 
 English: [README.md](README.md)
+
+## Windows (PowerShell `vdns.ps1`)
+
+Zero dependências externas — usa `Resolve-DnsName` nativo, RDAP HTTPS e fallback WHOIS via `.NET TcpClient` no **Windows PowerShell 5.1** e **PowerShell 7+**:
+
+```powershell
+.\vdns.ps1 -All perciocastelo.com.br
+.\vdns.ps1 -Registrar -Dns -Propagation example.com -Output json
+.\vdns.ps1 -All github.io -Output csv
+```
