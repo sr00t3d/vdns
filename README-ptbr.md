@@ -1,5 +1,7 @@
 # vdns
 
+![vdns Cover](vdns-cover.webp)
+
 `vdns` é uma CLI em Bash para diagnóstico completo de DNS e consulta de registro de domínios. Projetada para sysadmins, equipes de NOC e engenheiros de hospedagem, combina consultas autoritativas via `dig` com consultas **RDAP** oficiais no **Registro.br** (`rdap.registro.br`) e em TLDs internacionais (`rdap.org`), com saída estruturada em `table`, `json` e `csv`.
 
 ## Principais Recursos
